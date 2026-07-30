@@ -1,0 +1,3096 @@
+# ------------------------------------------------------------------------------------#
+#   TCGA - LUSC (Analysis to find relativrly stable genes independent of tumor purity) 
+# ------------------------------------------------------------------------------------#
+
+# ------------------------------------------------------------------#
+#   Install any missing packages, then load them
+# ------------------------------------------------------------------#
+
+# CRAN packages
+cran_packages <- c("tidyverse", "ggplot2", "dplyr", "UpSetR", "pheatmap", "writexl")
+
+new_cran <- cran_packages[!(cran_packages %in% installed.packages()[, "Package"])]
+if (length(new_cran) > 0) {
+  install.packages(new_cran)
+}
+
+# Bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+bioc_packages <- c("TCGAbiolinks", "SummarizedExperiment", "edgeR",
+                    "org.Hs.eg.db", "limma", "sva")
+
+new_bioc <- bioc_packages[!(bioc_packages %in% installed.packages()[, "Package"])]
+if (length(new_bioc) > 0) {
+  BiocManager::install(new_bioc, update = FALSE, ask = FALSE)
+}
+
+# Load everything
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(edgeR)
+library(org.Hs.eg.db)
+library(tidyverse)
+library(ggplot2)
+library(limma)
+library(dplyr)
+library(UpSetR)
+library(pheatmap)
+library(sva)
+library(writexl)
+
+
+
+query_lu <- GDCquery(
+  project               = "TCGA-LUSC",
+  data.category         = "Transcriptome Profiling",
+  data.type             = "Gene Expression Quantification",
+  workflow.type         = "STAR - Counts",
+  experimental.strategy = "RNA-Seq"
+)
+
+# GDCdownload(query_lu) if not already downloaded 
+
+se_lu <- GDCprepare(query_lu)
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#                    I. Setting up and Cleaning the Data  
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# Load the col_data of the LUSC to the global environment.
+
+col_data_lu_full <- as.data.frame(colData(se_lu))
+
+# Take out the necessary data from col_data_lu_full for the analysis, the necessary
+
+col_data_lu <- col_data_lu_full %>%
+  select(
+    barcode,
+    age_at_index,
+    sex_at_birth,
+    tissue_type,
+    ajcc_pathologic_stage,
+    primary_diagnosis,
+    prior_treatment
+  )
+
+
+# We will now be examining the data for NA's the reason being if the NA's are 
+# present that means we do not know that status of the variable.
+
+# Let us check the age for the NA's.
+
+table(
+  is.na(col_data_lu$age_at_index)
+)
+
+#FALSE  TRUE 
+#553     9 
+
+
+# We have # 553 NA's in the data and we must remove them. 
+
+col_data_lu <- col_data_lu %>%
+  filter(
+    !is.na(age_at_index)
+  )
+
+# Let us verify if the NA containing samples have been successfully removed. 
+
+table(
+  is.na(col_data_lu$age_at_index)
+)
+
+#FALSE 
+#553 
+
+# Yes, the NA containing samples have been removed truly.
+
+
+# We shall now check the Gender for the NA's.
+
+table(
+  col_data_lu$tissue_type,
+  col_data_lu$sex_at_birth,
+  useNA = "always"
+)
+
+#         female male <NA>
+#Normal     14   37    0
+#Tumor     130  372    0
+#<NA>        0    0    0
+
+
+# There are no NA containing samples for gender therefore there is no need 
+# for the filter. 
+
+# Next, to keep only the samples which are treatment naive.
+# Checking to see how many samples are treatment naive. 
+
+table(
+  col_data_lu$prior_treatment,
+  col_data_lu$tissue_type ,
+  useNA = "always"
+)
+
+#      Normal Tumor <NA>
+#No       40   409    0
+#Yes      10    71    0
+#<NA>      1    22    0
+
+# We shall keep only the samples which are treatment naive
+
+col_data_lu <- col_data_lu %>%
+  filter(
+    prior_treatment == "No"
+  )
+
+# To check if we have removed all the samples which were treated and those 
+# that did not have the prior treatment status. 
+
+table(
+  col_data_lu$prior_treatment,
+  col_data_lu$tissue_type,
+  useNA = "always"
+)
+
+#      Normal Tumor <NA>
+#No       40   409    0
+#<NA>      0     0    0
+
+# We have successfully removed all the samples which were treated and those 
+# that did not have the prior treatment status.  
+
+table(
+  col_data_lu$tissue_type,
+  useNA = "always"
+)
+
+#Normal  Tumor   <NA> 
+#  40    409      0 
+
+
+# lets see what are the primary diagnosis here 
+
+table(col_data_lu$primary_diagnosis, col_data_lu$tissue_type, useNA = "always")
+
+#                                                             Normal Tumor <NA>
+#Basaloid squamous cell carcinoma                               2    10    0
+#Papillary squamous cell carcinoma                              0     4    0
+#Squamous cell carcinoma, keratinizing, NOS                     2    10    0
+#Squamous cell carcinoma, large cell, nonkeratinizing, NOS      0     2    0
+#Squamous cell carcinoma, NOS                                  35   382    0
+#Squamous cell carcinoma, small cell, nonkeratinizing           1     1    0
+#<NA>                                                           0     0    0
+
+# We will choose only the Squamous cell carcinoma, NOS for both tumor and normal
+
+col_data_lu <- col_data_lu %>%
+  filter(primary_diagnosis == "Squamous cell carcinoma, NOS")
+
+# Now from our pan tissue exploration of data we shall move into tumor specific
+# data exploration because stage of a normal  do not affect the biology of the tissue. 
+# Therefore we do not need
+# to remove the normal tissue based on their stage status.
+
+
+col_data_lu_tumor <- col_data_lu %>%
+  filter(tissue_type == "Tumor")
+
+
+# We shall now remove the tumor samples which are NA for stage  
+
+table(
+  col_data_lu_tumor$ajcc_pathologic_stage, 
+  useNA = "always"
+)
+
+#   Stage I   Stage IA   Stage IB   Stage II  Stage IIA  Stage IIB  Stage III Stage IIIA 
+#3         70        119          3         51         76          2         37 
+#Stage IIIB   Stage IV       <NA> 
+#  13          5          3 
+
+# We have 3 samples that are NA for stage and we shall remove them 
+
+col_data_lu_tumor <- col_data_lu_tumor %>%
+  filter(!is.na(ajcc_pathologic_stage))
+
+# Check if whether tumor samples containing the NA's for Stage 
+#have been removed or not 
+
+table(
+  col_data_lu_tumor$ajcc_pathologic_stage,
+  useNA = "always"
+)
+
+#   Stage I   Stage IA   Stage IB   Stage II  Stage IIA  Stage IIB  Stage III Stage IIIA 
+#3         70        119          3         51         76          2         37 
+#Stage IIIB   Stage IV       <NA> 
+#  13          5          0 
+
+# This confirms the samples which are NA for stage have been removed 
+
+
+# Now we have to make the Stage simpler the rationale being if the Stage's 
+# are spread out in the tumor samples from Stage I to Stage IV with all the 
+# stages in between it reduces the number of samples in any single stage
+# level to the point where using Stage as a covariate (or checking it for
+# confounding) becomes statistically unstable.
+
+
+
+col_data_lu_tumor$stage_simple <- gsub("[ABC]",
+                                       "",
+                                       col_data_lu_tumor$ajcc_pathologic_stage
+) 
+
+
+# To look how the data is when the stage has been simplified. 
+
+table(col_data_lu_tumor$stage_simple,
+      useNA = "always"
+)
+
+# Stage I  Stage II Stage III  Stage IV      <NA> 
+# 192       130        52         5         0 
+
+
+
+# We have only the 4 Stages
+
+
+# Now, to merge tumor back with normal but normal but there is no normal data
+# akin to the col_data_lu_tumor therefore we must create one first.
+
+col_data_lu_normal <- col_data_lu %>%
+  filter(tissue_type == "Normal")
+
+# Confirm if it has been created correctly 
+
+table(col_data_lu_normal$tissue_type,
+      useNA = "always"
+)
+
+#Normal   <NA> 
+#  35      0 
+
+# Yes it is confirmed and they have 35 Normal Samples
+
+# Lets look at the stage distribution of the normal samples 
+
+table(col_data_lu_normal$ajcc_pathologic_stage,
+      useNA = "always"
+)
+
+#Stage IA   Stage IB   Stage II  Stage IIA  Stage IIB Stage IIIA  Stage IV  <NA> 
+#  5         13          1          6          8          1         1       0 
+
+# We have to simplify the stage of the normal's too so that we can rbind 
+# the col_data_lu_tumor with the col_data_lu_normal 
+
+
+col_data_lu_normal$stage_simple <- gsub("[ABC]",
+                                        "",
+                                        col_data_lu_normal$ajcc_pathologic_stage)
+
+# Confirm the changes that has been made
+
+table(col_data_lu_normal$stage_simple,
+      useNA = "always"
+)
+
+#Stage I  Stage II Stage III  Stage IV      <NA> 
+#  18        15         1         1         0 
+
+
+# I think now its time to make a new col_data_lu that which is more refined 
+# by merging the col_data_lu_normal and col_data_lu_tumor 
+
+all(colnames(col_data_lu_tumor) 
+    == colnames(col_data_lu_normal)
+)
+
+
+#[1] TRUE
+
+# This confirms they both have the same variables arranged in the same manner
+
+# Therefore we can simply rbind 
+
+col_data_lu <- rbind(col_data_lu_normal,
+                     col_data_lu_tumor
+)
+
+# Confirm the bind has occured or not by using the tissue type 
+
+table(col_data_lu$tissue_type,
+      useNA = "always"
+)
+
+#Normal  Tumor   <NA> 
+#  35    391      0 
+
+
+# Therefore this marks the end of the data cleaning to summarise what we have 
+# done very crisply without using any numbers. We took the col_data sample
+# of the TCGA_LUSC and chose barcodes, age , gender , tissue type, 
+# Stage, primary diagnosis and the treatment status. Well, the barcode is barcode
+# we simply need it for any analysis in TCGA. For the rest of the variables we 
+# made sure none of them are NA, we made sure all samples are treatment
+# naive , we made sure all the samples are (including the normals) from the 
+# primary diagnosis Squamous Cell Carcinoma, NOS 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#                        II. Setting up the expression matrix   
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# Now in this division of the code we will be loading the expression matrix 
+# that is the mRNA expression matrix of the LUSC to the global environment
+# remove the genes which are non protein coding and also change the names of the 
+# rownames of the expression matrix from gene id's to the gene names.
+
+
+# Loading the expr_matrix to the environment. 
+
+expr_matrix_lu <- as.data.frame(assay(se_lu))
+
+gene_data <- as.data.frame(rowRanges(se_lu))
+
+# Remove the genes from the gene data which are not protein coding 
+
+gene_data <- gene_data %>%
+  filter(gene_type == "protein_coding") %>%
+  distinct(gene_name , .keep_all = TRUE)
+
+
+# subsetting the expr_matrix for the protein encoding genes 
+
+expr_matrix_lu <- expr_matrix_lu[gene_data$gene_id,]
+
+# Replace the gene ids with gene name 
+
+all(gene_data$gene_id == rownames(expr_matrix_lu))
+
+#[1] TRUE
+
+# the logic behind using "all" function is that if every gene id is matched 
+# with the rownames of the expression matrix in the same order and every gene 
+# name is matched  with gene id in the gene data in the same order 
+# Now since gene id are matched in gene data we can simply replace the gene_id 
+# in expr_matrix with gene_name. 
+
+# The logic being if A = B and if B = C , this means that A = C 
+
+rownames(expr_matrix_lu) <- gene_data$gene_name
+
+# As you can see down below 
+
+rownames(expr_matrix_lu)[1:5]
+#[1] "TSPAN6"   "TNMD"     "DPM1"     "SCYL3"    "C1orf112"
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#                   III. Assigning Tumor Purity Using CPE  
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+
+
+
+# So to check the variance first we have to get the tumor purity data 
+
+tumor_purity <- TCGAbiolinks::Tumor.purity
+
+head(tumor_purity)
+
+#Sample.ID Cancer.type ESTIMATE ABSOLUTE   LUMP  IHC    CPE
+#1 TCGA-OR-A5J1-01A         ACC   0,9368      NaN 0,9774  0,8 0,9246
+#2 TCGA-OR-A5J2-01A         ACC   0,9175      NaN 0,6174 0,95 0,8985
+#3 TCGA-OR-A5J3-01A         ACC    0,967      NaN 0,9249  0,8 0,9466
+#4 TCGA-OR-A5J4-01A         ACC      NaN      NaN 0,9199  0,8  0,866
+#5 TCGA-OR-A5J5-01A         ACC   0,9761      NaN      1  0,8  0,978
+#6 TCGA-OR-A5J6-01A         ACC   0,8741      NaN 0,7445 0,88 0,8396
+
+# As we can see inorder to merge this with the col_data_lu we need 
+# to make a simpler barcode for the col_data_lu and also at the same time 
+# make the barcodes as rownames in tumor_purity 
+
+rownames(tumor_purity) <- tumor_purity$Sample.ID
+
+head(tumor_purity)
+
+#                   Sample.ID          Cancer.type ESTIMATE ABSOLUTE LUMP  IHC    CPE
+
+#TCGA-OR-A5J1-01A TCGA-OR-A5J1-01A         ACC   0,9368      NaN   0,9774  0,8  0,9246
+#TCGA-OR-A5J2-01A TCGA-OR-A5J2-01A         ACC   0,9175      NaN   0,6174  0,95  0,8985
+#TCGA-OR-A5J3-01A TCGA-OR-A5J3-01A         ACC    0,967      NaN   0,9249  0,8  0,9466
+#TCGA-OR-A5J4-01A TCGA-OR-A5J4-01A         ACC      NaN      NaN   0,9199  0,8  0,866
+#TCGA-OR-A5J5-01A TCGA-OR-A5J5-01A         ACC   0,9761      NaN        1  0,8  0,978
+#TCGA-OR-A5J6-01A TCGA-OR-A5J6-01A         ACC   0,8741      NaN   0,7445  0,88  0,8396
+
+
+# See now you can see the tumor_purity have rownames 
+
+# Time to make the rownames similar in col_data_lu by that I mean only choosing 
+# first 16 characters therefore both will match 
+
+
+col_data_lu$barcode_simple <- substr(col_data_lu$barcode,1,16)
+
+# Relocating the col_data_lu's barcode simple next to the barcode 
+
+col_data_lu <- col_data_lu %>%
+  relocate(barcode_simple , .after = barcode  )
+
+
+col_data_lu$CPE <- tumor_purity[col_data_lu$barcode_simple,"CPE"]
+
+
+table(is.na(col_data_lu$CPE))
+#FALSE  TRUE 
+#379    35 
+
+table(col_data_lu$tissue_type, useNA = "always")
+
+#Normal  Tumor   <NA> 
+#  35    379      0
+
+# So there are 35 NA's in the col_data_lu
+
+#  So we need to know if normals are having these NA's or tumor samples are 
+# having these NA's 
+
+col_data_lu %>%
+  filter(tissue_type == "Normal") %>%
+  count(is.na(CPE))
+#  is.na(CPE)  n
+#1       TRUE 35
+
+# That proves that all the NA's are in normal since all 35 are in Normal 
+# nothing can be in the Tumor 
+
+# This is a method where we remove Nan if present in the Tumor because 
+# the CPE scores are known to have NaN's
+
+col_data_lu <- col_data_lu %>% 
+  filter(!(tissue_type == "Tumor" & CPE == "NaN"))
+
+
+table(col_data_lu$tissue_type, useNA = "always")
+
+#Normal  Tumor   <NA> 
+#  35    379      0 
+
+# okay all the NaN's have been removed 
+
+# Now we have to do CPE score based tumor grouping 
+
+col_data_lu_tumor <- col_data_lu %>%
+  filter(tissue_type == "Tumor")
+
+col_data_lu_tumor$CPE <- gsub(",",".",col_data_lu_tumor$CPE)
+
+class(col_data_lu_tumor$CPE)
+#[1] "character"
+
+# Lets make this numeric 
+
+col_data_lu_tumor$CPE <- as.numeric(col_data_lu_tumor$CPE)
+
+
+class(col_data_lu_tumor$CPE)
+#[1] "numeric"
+
+# We are checking the quantiles if they are sufficient for doing this analysis 
+# for further info regarding this check the heading below this section of 
+# the code 
+
+summary(col_data_lu_tumor$CPE)
+
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.2998  0.5879  0.6839  0.6716  0.7752  0.9876 
+
+
+
+
+round(quantile(col_data_lu_tumor$CPE, probs = seq(0.0,1, by = 0.05)),2) 
+#0%   5%  10%  15%  20%  25%  30%  35%  40%  45%  50% 
+#0.30 0.41 0.45 0.50 0.55 0.59 0.61 0.63 0.65 0.66 0.68 
+
+#50%  55%  60%  65%  70%  75%  80%  85%  90%  95% 100% 
+#0.68 0.70 0.72 0.74 0.76 0.78 0.79 0.82 0.84 0.89 0.99
+
+q80 <- quantile(col_data_lu_tumor$CPE,0.80)
+q60 <- quantile(col_data_lu_tumor$CPE,0.60)
+q40 <- quantile(col_data_lu_tumor$CPE,0.40)
+q20 <- quantile(col_data_lu_tumor$CPE, 0.20)
+
+# So the reason for choosing these quantiles in particular is so that the 
+# difference in medians between the CPE_very_high and CPE_very_low is of 0.40
+# points and the difference between CPE_very_high and CPE_moderate is 0.20 
+# points and the difference between CPE_very_low and CPE_moderate is 0.20 points 
+
+# This difference of approximately 20 points forms the basis of this analysis 
+
+col_data_lu_tumor <- col_data_lu_tumor %>%
+  mutate(tumor_purity_group = case_when(
+    CPE >= q80                  ~ "CPE_very_high",   
+    CPE <  q80 & CPE >= q60     ~ "CPE_high",        
+    CPE <  q60 & CPE >= q40     ~ "CPE_moderate",    
+    CPE <  q40 & CPE >= q20     ~ "CPE_low",         
+    CPE <  q20                  ~ "CPE_very_low"    
+  ))
+
+
+tapply(col_data_lu_tumor$CPE,col_data_lu_tumor$tumor_purity_group,summary)
+
+#$CPE_high
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.7219  0.7402  0.7574  0.7582  0.7747  0.7932 
+
+#$CPE_low
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.5552  0.5885  0.6126  0.6098  0.6325  0.6494 
+
+#$CPE_moderate
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.6509  0.6605  0.6839  0.6818  0.7019  0.7136 
+
+#$CPE_very_high
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.7965  0.8170  0.8431  0.8578  0.8878  0.9876 
+
+#$CPE_very_low
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.2998  0.4068  0.4531  0.4504  0.5032  0.5517
+
+
+table(col_data_lu_tumor$tumor_purity_group)
+
+
+#CPE_high       CPE_low  CPE_moderate CPE_very_high  CPE_very_low 
+#76            76            75            76            76 
+
+
+# Now we have to merge this with normal 
+
+col_data_lu_normal <- col_data_lu %>%
+  filter(tissue_type == "Normal")
+
+# We have to assign purity_groups to Normal for the merge because we want 
+# same columns to be there between the tumor and the normal col_data_lu
+# for the merge 
+
+
+col_data_lu_normal <- col_data_lu_normal %>%
+  mutate(tumor_purity_group = tissue_type)
+
+
+all(colnames(col_data_lu_normal) == colnames(col_data_lu_tumor))
+#[1] TRUE
+
+
+# I think we can merge now 
+
+# but one thing to check we need to make the CPE of normal into characters 
+class(col_data_lu_normal$CPE)
+#[1] "factor"
+col_data_lu_normal$CPE <- as.character(col_data_lu_normal$CPE)
+
+# also lets make the CPE of tumor to character now 
+
+col_data_lu_tumor$CPE <- as.character(col_data_lu_tumor$CPE)
+
+
+# Yes now definitely we can merge 
+
+col_data_lu <- rbind(col_data_lu_normal,
+                     col_data_lu_tumor
+)
+
+table(col_data_lu$tumor_purity_group,
+      useNA = "always"
+)
+
+#     CPE_high       CPE_low  CPE_moderate CPE_very_high  CPE_very_low        Normal 
+#76            76            75            76            76            35 
+#<NA> 
+#  0 
+
+# Before we proceed further down we will take the batch for analysis 
+
+col_data_lu$batch <- substr(col_data_lu$barcode,6,7)
+
+table(col_data_lu$batch, 
+      useNA = "always"
+)
+
+
+#18   21   22   33   34   37   39   43   46   51   52   56   58   60   63   66   68   6A   70 
+#13   16   37   14   16   13   10   20    6    5    3   41    9   15   13   38    5    1    1 
+#   77   85   90   92   94   96   98   J1   L3   LA   NC   NK   O2   XC <NA> 
+#  37   44    9    4    9    4   12    1    2    1    6    3    5    1    0 
+
+
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# IV. The confounding check (CPE_very_high vs Normal) 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#  We subset CPE_very_high and Normal from the col_data_lu 
+
+col_data_lu_CPE_very_high_vs_normal <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_very_high","Normal"))
+
+table(col_data_lu_CPE_very_high_vs_normal$tumor_purity_group, useNA = "always")
+
+#CPE_very_high        Normal          <NA> 
+#        76            35             0 
+
+table(col_data_lu_CPE_very_high_vs_normal$tumor_purity_group,
+      col_data_lu_CPE_very_high_vs_normal$batch, useNA = "always")
+
+#               18 21 22 33 34 37 43 46 51 56 58 60 63 66 6A 77 85 90 92 94 L3 NC O2 <NA>
+#CPE_very_high  5  4  4  8  1  4  1  2  2  6  1  2  6  6  1  8  8  1  0  3  1  1  1    0
+#Normal         0  0  7  0  2  0  5  0  2  8  1  1  0  0  0  5  1  2  1  0  0  0  0    0
+#<NA>           0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0    0
+
+# Let us test if batch is confounding or not 
+set.seed(42)
+fisher.test(col_data_lu_CPE_very_high_vs_normal$tumor_purity_group,
+            col_data_lu_CPE_very_high_vs_normal$batch, simulate.p.value = TRUE)
+
+#Fisher's Exact Test for Count Data with simulated p-value (based on 2000
+#	replicates)
+
+#data:  col_data_lu_CPE_very_high_vs_normal$tumor_purity_group and col_data_lu_CPE_very_high_vs_normal$batch
+#p-value = 0.0004998
+#alternative hypothesis: two.sided
+
+# Batch is confounding 
+
+# Lets do pre batch correction so Combat can handle so here we are taking out 
+# the samples which are singular for a batch basically samples which are 
+# only one across both tumor and normal for one batch is taken as other 
+
+col_data_lu_CPE_very_high_vs_normal <- col_data_lu_CPE_very_high_vs_normal %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  )) 
+
+table(col_data_lu_CPE_very_high_vs_normal$batch_for_combat)
+
+#18    21    22    33    34    37    43    46    51    56    58    60    63    66    77    85 
+#5     4    11     8     3     4     6     2     4    14     2     3     6     6    13     9 
+#90    94 other 
+#3     3     5 
+
+# Checking if there is significant difference in age. Here the significant 
+# difference in age is not just the p_value. Its more importantly the value 
+# of the difference between the quantiles 
+
+tapply(col_data_lu_CPE_very_high_vs_normal$age_at_index,
+       col_data_lu_CPE_very_high_vs_normal$tumor_purity_group, summary)
+
+
+#$CPE_very_high
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   58.00   65.00   64.63   70.00   83.00 
+
+#$Normal
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   64.00   69.00   69.26   75.50   85.00 
+
+
+# And from what we see a median difference  between the samples by 5 years 
+#needs correction
+
+# We will do both Wilcox test and the t.test for statistical rigor Wilcox 
+# test because the distribution of age in these samples are not  usually normal
+# distribution . And Wilcox test works best for the skewed samples 
+# and that why we use Wilcox test. I am not saying this correct sample is skewed
+# its just used for methodological similarity. 
+
+# Shapiro test here testing for normal distribution or not !!!
+
+shapiro.test(col_data_lu_CPE_very_high_vs_normal$age_at_index)
+
+#Shapiro-Wilk normality test
+
+#data:  col_data_lu_CPE_very_high_vs_normal$age_at_index
+#W = 0.98835, p-value = 0.4568
+
+# Wilcox test testing for whether age is significantly different between groups 
+# or not 
+
+wilcox.test(col_data_lu_CPE_very_high_vs_normal$age_at_index ~
+              col_data_lu_CPE_very_high_vs_normal$tumor_purity_group)
+
+
+#Wilcox on rank sum test with continuity correction
+
+#data:  col_data_lu_CPE_very_high_vs_normal$age_at_index by col_data_lu_CPE_very_high_vs_normal$tumor_purity_group
+#W = 931.5, p-value = 0.01147
+#alternative hypothesis: true location shift is not equal to 0
+
+# On Wilcox test the difference between the ages of these 2 groups are 
+# significant 
+
+# Lets do the t-test for whether age is significantly different between groups 
+# or not 
+
+t.test(col_data_lu_CPE_very_high_vs_normal$age_at_index ~
+         col_data_lu_CPE_very_high_vs_normal$tumor_purity_group)
+
+#Welch Two Sample t-test
+
+#data:  col_data_lu_CPE_very_high_vs_normal$age_at_index by col_data_lu_CPE_very_high_vs_normal$tumor_purity_group
+#t = -2.4856, df = 60.129, p-value = 0.01573
+#alternative hypothesis: true difference in means between group CPE_very_high and group Normal is not equal to 0
+#95 percent confidence interval:
+#  -8.3478154 -0.9033125
+#sample estimates:
+#  mean in group CPE_very_high        mean in group Normal 
+#64.63158                    69.25714
+
+# Okay age is significantly different between 2 groups 
+
+# lets check whether gender between these 2 groups are significantly different 
+# or not 
+
+table(col_data_lu_CPE_very_high_vs_normal$sex_at_birth,
+      col_data_lu_CPE_very_high_vs_normal$tumor_purity_group, useNA = "always")
+
+#             CPE_very_high Normal <NA>
+#female            17     11    0
+#male              59     24    0
+#<NA>               0      0    0
+
+# We will use fisher test for this comparison and since the p value will be simulated many
+# times we will use set.seed(42)
+
+set.seed(42)
+fisher.test(col_data_lu_CPE_very_high_vs_normal$sex_at_birth,
+            col_data_lu_CPE_very_high_vs_normal$tumor_purity_group,
+            simulate.p.value = TRUE)
+
+#Fisher's Exact Test for Count Data
+
+#data:  col_data_lu_CPE_very_high_vs_normal$sex_at_birth and col_data_lu_CPE_very_high_vs_normal$tumor_purity_group
+#p-value = 0.3504
+#alternative hypothesis: true odds ratio is not equal to 1
+#95 percent confidence interval:
+# 0.5796638 4.2243531
+#sample estimates:
+#odds ratio 
+#  1.583798 
+
+# Gender is not confounding between these 2 groups 
+
+# Both Batch and Age are confounding with tumor_purity_group
+# lets check if batch is confounding with age 
+
+age_batch_aov_CPE_very_high_vs_normal <- aov(age_at_index ~ batch, 
+                                             data = col_data_lu_CPE_very_high_vs_normal)
+
+summary(age_batch_aov_CPE_very_high_vs_normal)
+
+#Df Sum Sq Mean Sq F value  Pr(>F)   
+#batch       22   3292  149.65   2.366 0.00245 **
+#  Residuals   88   5565   63.24                   
+#---
+#  Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+# Batch is confounding with age
+
+# There to summarize 
+# 1. The batch is confounding with age 
+# 2. The batch is confounding between 2 purity groups 
+# 3. The age is significantly different between 2 groups 
+
+
+
+# ==============================================================================
+# Comparison 1: CPE_very_high vs Normal (Set A1)
+# Covariates: age + batch
+# ==============================================================================
+
+
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_very_high_vs_normal$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_very_high_vs_normal$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_very_high_vs_normal$tumor_purity_group <- factor(
+  col_data_lu_CPE_very_high_vs_normal$tumor_purity_group, levels = c("Normal", "CPE_very_high"))
+col_data_lu_CPE_very_high_vs_normal$batch_for_combat <- factor(col_data_lu_CPE_very_high_vs_normal$batch_for_combat)
+
+design <- model.matrix(~ age_at_index + batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_very_high_vs_normal)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_very_high_vs_normal <- topTable(fit, coef = "tumor_purity_groupCPE_very_high",
+                                                  number = Inf, sort.by = "P")
+results_limma_CPE_very_high_vs_normal$gene <- rownames(results_limma_CPE_very_high_vs_normal)
+
+results_limma_CPE_very_high_vs_normal_sig_up <- results_limma_CPE_very_high_vs_normal %>%
+  filter(adj.P.Val < 0.05 & logFC >= 1) %>% arrange(desc(logFC))
+results_limma_CPE_very_high_vs_normal_sig_down <- results_limma_CPE_very_high_vs_normal %>%
+  filter(adj.P.Val < 0.05 & logFC <= -1) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_very_high_vs_normal_sig_up)
+#[1] 3078
+
+nrow(results_limma_CPE_very_high_vs_normal_sig_down)
+#[1] 3909
+
+
+rm(dge, keep, design, v, fit)
+
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# # V. The confounding check CPE_very_high vs CPE_moderate
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+col_data_lu_CPE_moderate_vs_CPE_very_high <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_moderate","CPE_very_high"))
+
+# Lets see how many samples are in CPE_Very_high and CPE_moderate 
+
+table(col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group, useNA = "always")
+
+#CPE_moderate CPE_very_high          <NA> 
+#        75            76             0 
+
+# Lets see the batch distribution 
+
+table(col_data_lu_CPE_moderate_vs_CPE_very_high$batch,
+      col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group,
+      useNA = "always")
+
+
+# Lets check for batch if its is confounding between these 2 tumor_purity
+# groups  
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_moderate_vs_CPE_very_high$batch,
+                  col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+# p > 0.05
+
+# batch for Combat 
+col_data_lu_CPE_moderate_vs_CPE_very_high <- 
+  col_data_lu_CPE_moderate_vs_CPE_very_high %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+
+# Lets check for Stage if its is confounding between these 2 tumor_purity
+# groups 
+
+table(col_data_lu_CPE_moderate_vs_CPE_very_high$stage_simple,
+      col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group,
+      useNA = "always")
+#        CPE_moderate CPE_very_high <NA>
+#Stage I             47            35    0
+#Stage II            23            28    0
+#Stage III            7            12    0
+#Stage IV             1             1    0
+#<NA>                 0             0    0
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_moderate_vs_CPE_very_high$stage_simple,
+                  col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+#Fisher's Exact Test for Count Data with simulated p-value (based on 2000 replicates)
+
+#data:  table(col_data_lu_CPE_moderate_vs_CPE_very_high$stage_simple, col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group)
+#p-value = 0.6787
+#alternative hypothesis: two.sided
+
+# No stage confounding between 2 batches 
+
+
+# lets check for age if there is difference in median between these 
+# 2 groups 
+
+tapply(col_data_lu_CPE_moderate_vs_CPE_very_high$age_at_index,
+       col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group,summary)
+
+#$CPE_moderate
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#40.00   64.00   69.50   68.44   74.00   85.00 
+
+#$CPE_very_high
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   58.00   65.00   64.63   70.00   83.00
+
+# Shapiro test for checking the distribution
+
+shapiro.test(col_data_lu_CPE_moderate_vs_CPE_very_high$age_at_index)
+
+#Shapiro-Wilk normality test
+
+#data:  col_data_lu_CPE_moderate_vs_CPE_very_high$age_at_index
+#W = 0.98876, p-value = 0.2543
+
+wilcox.test(col_data_lu_CPE_moderate_vs_CPE_very_high$age_at_index ~
+              col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group)
+
+#Wilcoxon rank sum test with continuity correction
+
+#data:  col_data_lu_CPE_moderate_vs_CPE_very_high$age_at_index by col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group
+#W = 3788.5, p-value = 0.00288
+#alternative hypothesis: true location shift is not equal to 0
+
+
+t.test(col_data_lu_CPE_moderate_vs_CPE_very_high$age_at_index ~
+         col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group)
+
+#Welch Two Sample t-test
+
+#data:  col_data_lu_CPE_moderate_vs_CPE_very_high$age_at_index by col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group
+#t = 2.7427, df = 151.97, p-value = 0.006826
+#alternative hypothesis: true difference in means between group CPE_moderate and group CPE_very_high is not equal to 0
+#95 percent confidence interval:
+#  1.063878 6.544759
+#sample estimates:
+#  mean in group CPE_moderate mean in group CPE_very_high 
+#68.43590                    64.63158 
+
+# There is  need for age based correction 
+
+# Lets check for gender if that it needs to be a covariate or not 
+
+table(col_data_lu_CPE_moderate_vs_CPE_very_high$sex_at_birth ,
+      col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group,
+      useNA = "always")
+
+#CPE_moderate CPE_very_high <NA>
+#female           13            17    0
+#male             62            59    0
+#<NA>              0             0    0
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_moderate_vs_CPE_very_high$sex_at_birth ,
+                  col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+#Fisher's Exact Test for Count Data
+
+#data:  table(col_data_lu_CPE_moderate_vs_CPE_very_high$sex_at_birth, col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group)
+#p-value = 0.5415
+#alternative hypothesis: true odds ratio is not equal to 1
+#95 percent confidence interval:
+# 0.2972611 1.7531360
+##sample estimates:
+#odds ratio 
+#  0.729242
+
+# Gender will not be a covariate 
+
+
+#  Decision summary for Set B:
+
+#Batch → p > 0.05  include regardless of the p value the median difference matters mode 
+#Stage → p > 0.05 → exclude
+#Age → p < 0.05  → include as the difference is 4.5 years 
+#Gender  →  p > 0.05  → exclude
+
+
+
+
+# ==============================================================================
+# Comparison : CPE_moderate vs CPE_very_high 
+# Covariates: age + batch
+# ==============================================================================
+
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_moderate_vs_CPE_very_high$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group <- factor(
+  col_data_lu_CPE_moderate_vs_CPE_very_high$tumor_purity_group, levels = c("CPE_moderate", "CPE_very_high"))
+col_data_lu_CPE_moderate_vs_CPE_very_high$batch_for_combat <- factor(col_data_lu_CPE_moderate_vs_CPE_very_high$batch_for_combat)
+
+design <- model.matrix(~ age_at_index + batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_moderate_vs_CPE_very_high)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_moderate_vs_CPE_very_high <- topTable(fit, coef = "tumor_purity_groupCPE_very_high",
+                                                        number = Inf, sort.by = "P")
+results_limma_CPE_moderate_vs_CPE_very_high$gene <- rownames(results_limma_CPE_moderate_vs_CPE_very_high)
+
+results_limma_CPE_moderate_vs_CPE_very_high_sig <- results_limma_CPE_moderate_vs_CPE_very_high %>%
+  filter(adj.P.Val < 0.05 & (logFC > 0.213 | logFC < -0.250)) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_moderate_vs_CPE_very_high_sig)
+#2139
+rm(dge, keep, design, v, fit)
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# # VI. The confounding check before getting SETC1  ,we check for 
+# confounding between the important variables. (CPE_very_high vs CPE_very_low)
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+
+# Take the data out 
+
+col_data_lu_CPE_very_low_vs_CPE_very_high <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_very_low", 
+                                   "CPE_very_high"))
+
+table(col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group, useNA = "always")
+
+#CPE_very_high  CPE_very_low          <NA> 
+#       76            76             0 
+
+# Batch
+table(col_data_lu_CPE_very_low_vs_CPE_very_high$batch,
+      col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group,
+      useNA = "always")
+
+
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_very_low_vs_CPE_very_high$batch,
+                  col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE)
+# p < 0.05
+
+
+
+col_data_lu_CPE_very_low_vs_CPE_very_high <- col_data_lu_CPE_very_low_vs_CPE_very_high %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+table(col_data_lu_CPE_very_low_vs_CPE_very_high$batch_for_combat)
+
+
+# Stage
+table(col_data_lu_CPE_very_low_vs_CPE_very_high$stage_simple,
+      col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group,
+      useNA = "always")
+
+
+#              CPE_very_high CPE_very_low <NA>
+#Stage I              35           43    0
+#Stage II             28           20    0
+#Stage III            12           13    0
+#Stage IV              1            0    0
+#<NA>                  0            0    0
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_very_low_vs_CPE_very_high$stage_simple,
+                  col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+#Fisher's Exact Test for Count Data with simulated p-value (based on 2000 replicates)
+
+#data:  table(col_data_lu_CPE_very_low_vs_CPE_very_high$stage_simple, col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group)
+#p-value = 0.3603
+#alternative hypothesis: two.sided
+
+# Stage is  not confounding 
+
+# Lets see if age is different between these 2 groups
+# Age
+tapply(col_data_lu_CPE_very_low_vs_CPE_very_high$age_at_index,
+       col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group, summary)
+
+
+#$CPE_very_high
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   58.00   65.00   64.63   70.00   83.00 
+
+#$CPE_very_low
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#47.00   62.00   68.50   67.89   74.00   84.00 
+
+
+shapiro.test(col_data_lu_CPE_very_low_vs_CPE_very_high$age_at_index)
+# The distribution is normal 
+
+wilcox.test(col_data_lu_CPE_very_low_vs_CPE_very_high$age_at_index ~
+              col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group)
+
+
+#Wilcoxon rank sum test with continuity correction
+
+#data:  col_data_lu_CPE_very_low_vs_CPE_very_high$age_at_index by col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group
+#W = 2221.5, p-value = 0.01404
+#alternative hypothesis: true location shift is not equal to 0
+
+
+t.test(col_data_lu_CPE_very_low_vs_CPE_very_high$age_at_index ~
+         col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group)
+
+#Welch Two Sample t-test
+
+#data:  col_data_lu_CPE_very_low_vs_CPE_very_high$age_at_index by col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group
+#t = -2.4218, df = 149.85, p-value = 0.01664
+#alternative hypothesis: true difference in means between group CPE_very_high and group CPE_very_low is not equal to 0
+#95 percent confidence interval:
+#  -5.9255873 -0.6007285
+#sample estimates:
+#  mean in group CPE_very_high  mean in group CPE_very_low 
+#64.63158                    67.89474 
+
+# Age is  significantly different between these 2 groups but only by 3 years 
+
+# Let us check for Gender confounding 
+
+table(col_data_lu_CPE_very_low_vs_CPE_very_high$sex_at_birth ,
+      col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group,
+      useNA = "always")
+
+#      CPE_very_high CPE_very_low <NA>
+#female            17           29    0
+#male              59           47    0
+#<NA>               0            0    0
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_very_low_vs_CPE_very_high$sex_at_birth ,
+                  col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE, B = 1e5)
+
+#Fisher's Exact Test for Count Data
+
+#data:  table(col_data_lu_CPE_very_low_vs_CPE_very_high$sex_at_birth, col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group)
+#p-value = 0.0515
+#alternative hypothesis: true odds ratio is not equal to 1
+#95 percent confidence interval:
+# 0.2140456 1.0044610
+#sample estimates:
+#odds ratio 
+# 0.4693491 
+
+# gender is not confounding between 2 groups 
+
+
+#Decision summary for Set C:
+
+#Batch → p = <0.05 → include (batch always include)
+#Stage → p > 0.05 → exclude
+#Age → p  < 0.05 (3.5 year median difference between groups) so include
+# as a covariate 
+
+#Gender  →  p > barely above 0.05  → do not include  
+
+
+
+
+
+# ============================================================
+# Comparison 3: CPE_very_low vs CPE_very_high 
+# Covariates: age + batch
+# ============================================================
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_very_low_vs_CPE_very_high$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group <- factor(
+  col_data_lu_CPE_very_low_vs_CPE_very_high$tumor_purity_group, levels = c("CPE_very_high", "CPE_very_low"))
+col_data_lu_CPE_very_low_vs_CPE_very_high$batch_for_combat <- factor(col_data_lu_CPE_very_low_vs_CPE_very_high$batch_for_combat)
+
+design <- model.matrix(~ age_at_index + batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_very_low_vs_CPE_very_high)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_very_low_vs_CPE_very_high <- topTable(fit, coef = "tumor_purity_groupCPE_very_low",
+                                                        number = Inf, sort.by = "P")
+results_limma_CPE_very_low_vs_CPE_very_high$gene <- rownames(results_limma_CPE_very_low_vs_CPE_very_high)
+
+results_limma_CPE_very_low_vs_CPE_very_high_sig <- results_limma_CPE_very_low_vs_CPE_very_high %>%
+  filter(adj.P.Val < 0.05 & (logFC > 0.475 | logFC < -0.713)) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_very_low_vs_CPE_very_high_sig)
+# 4427
+rm(dge, keep, design, v, fit)
+
+
+
+
+
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                                                                              #
+#     # VII. The confounding check 
+#                       CPE_very_low vs normal                                                                        #
+#                                                                              #
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# Checking for the names of the tumor purity groups 
+
+table(col_data_lu$tumor_purity_group, useNA = "always")
+
+
+#CPE_high       CPE_low  CPE_moderate CPE_very_high  CPE_very_low        Normal          <NA> 
+#  76            76            75            76            76            35             0 
+
+# Lets take out the CPE_very_low and normal together in col_data
+
+col_data_lu_CPE_very_low_vs_normal <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_very_low","Normal"))
+
+
+table(col_data_lu_CPE_very_low_vs_normal$tumor_purity_group, useNA = "always")
+
+#CPE_very_low       Normal         <NA> 
+#  76                35            0 
+
+
+
+
+table(col_data_lu_CPE_very_low_vs_normal$batch,
+      col_data_lu_CPE_very_low_vs_normal$tumor_purity_group,
+      useNA = "always")
+
+
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_very_low_vs_normal$batch,
+                  col_data_lu_CPE_very_low_vs_normal$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+#Fisher's Exact Test for Count Data with simulated p-value (based on 2000 replicates)
+
+#data:  table(col_data_lu_CPE_very_low_vs_normal$batch, col_data_lu_CPE_very_low_vs_normal$tumor_purity_group)
+#p-value = 0.2224
+#alternative hypothesis: two.sided
+
+
+# Batch needs  correction regardless of the pvalue 
+col_data_lu_CPE_very_low_vs_normal <- 
+  col_data_lu_CPE_very_low_vs_normal %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n  < 2 ~ "other"
+  ))
+
+
+# Lets test if age is significantly different between 2 groups 
+
+tapply(col_data_lu_CPE_very_low_vs_normal$age_at_index ,
+       col_data_lu_CPE_very_low_vs_normal$tumor_purity_group,
+       summary)
+
+#$CPE_very_low
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#47.00   62.00   68.50   67.89   74.00   84.00 
+
+#$Normal
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   64.00   69.00   69.26   75.50   85.00 
+
+
+shapiro.test(col_data_lu_CPE_very_low_vs_normal$age_at_index)
+
+#Shapiro-Wilk normality test
+
+#data:  col_data_lu_CPE_very_low_vs_normal$age_at_index
+#W = 0.98326, p-value = 0.1795
+
+wilcox.test(col_data_lu_CPE_very_low_vs_normal$age_at_index ~
+              col_data_lu_CPE_very_low_vs_normal$tumor_purity_group)
+
+
+#Wilcoxon rank sum test with continuity correction
+
+#data:  col_data_lu_CPE_very_low_vs_normal$age_at_index by col_data_lu_CPE_very_low_vs_normal$tumor_purity_group
+#W = 1212, p-value = 0.4554
+#alternative hypothesis: true location shift is not equal to 
+
+t.test(col_data_lu_CPE_very_low_vs_normal$age_at_index ~
+         col_data_lu_CPE_very_low_vs_normal$tumor_purity_group)
+
+
+#Welch Two Sample t-test
+
+#data:  col_data_lu_CPE_very_low_vs_normal$age_at_index by col_data_lu_CPE_very_low_vs_normal$tumor_purity_group
+#t = -0.73824, df = 58.563, p-value = 0.4633
+#alternative hypothesis: true difference in means between group CPE_very_low and group Normal is not equal to 0
+#95 percent confidence interval:
+#  -5.055769  2.330957
+#sample estimates:
+#  mean in group CPE_very_low       mean in group Normal 
+#67.89474                                 69.257
+
+
+# Lets check if gender is confounding or not 
+
+table(col_data_lu_CPE_very_low_vs_normal$sex_at_birth ,
+      col_data_lu_CPE_very_low_vs_normal$tumor_purity_group,useNA = "always")
+
+#          CPE_very_low Normal <NA>
+#female           29     11    0
+#male             47     24    0
+#<NA>              0      0    0
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_very_low_vs_normal$sex_at_birth ,
+                  col_data_lu_CPE_very_low_vs_normal$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+#Fisher's Exact Test for Count Data
+
+#Fisher's Exact Test for Count Data
+
+#data:  table(col_data_lu_CPE_very_low_vs_normal$sex_at_birth, col_data_lu_CPE_very_low_vs_normal$tumor_purity_group)
+#p-value = 0.5306
+#alternative hypothesis: true odds ratio is not equal to 1
+#95 percent confidence interval:
+# 0.5359865 3.5120678
+#sample estimates:
+#odds ratio 
+#  1.342673 
+
+
+# There are no confounding in between CPE_very_low and normal in any of the 
+# variables except for batch but it doesnt matter if its confounding or not 
+# batch correction will be run 
+
+
+# ============================================================
+# Comparison : CPE_very_low vs Normal 
+# Covariates: batch only
+# ============================================================
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_very_low_vs_normal$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_very_low_vs_normal$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_very_low_vs_normal$tumor_purity_group <- factor(
+  col_data_lu_CPE_very_low_vs_normal$tumor_purity_group, levels = c("Normal", "CPE_very_low"))
+col_data_lu_CPE_very_low_vs_normal$batch_for_combat <- factor(col_data_lu_CPE_very_low_vs_normal$batch_for_combat)
+
+design <- model.matrix(~ batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_very_low_vs_normal)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_very_low_vs_normal <- topTable(fit, coef = "tumor_purity_groupCPE_very_low",
+                                                 number = Inf, sort.by = "P")
+results_limma_CPE_very_low_vs_normal$gene <- rownames(results_limma_CPE_very_low_vs_normal)
+
+results_limma_CPE_very_low_vs_normal_sig_up <- results_limma_CPE_very_low_vs_normal %>%
+  filter(logFC >= 1 & adj.P.Val < 0.05)
+results_limma_CPE_very_low_vs_normal_sig_down <- results_limma_CPE_very_low_vs_normal %>%
+  filter(logFC <= -1 & adj.P.Val < 0.05)
+
+nrow(results_limma_CPE_very_low_vs_normal_sig_up)
+# 2102
+nrow(results_limma_CPE_very_low_vs_normal_sig_down)
+# 2426
+rm(dge, keep, design, v, fit)
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#         # VIII. The confounding check CPE_very_low vs moderate                                    #
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+col_data_lu_CPE_moderate_vs_CPE_very_low <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_moderate","CPE_very_low"))
+
+table(col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group, useNA = "always")
+
+#CPE_moderate CPE_very_low         <NA> 
+#  75           76            0
+
+table(col_data_lu_CPE_moderate_vs_CPE_very_low$batch,
+      col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group, useNA = "always")
+
+
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_moderate_vs_CPE_very_low$batch,
+                  col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+# p > 0.05
+
+# There is no batch confounding  but still there will be batch correction 
+
+# batch_for_combat 
+
+col_data_lu_CPE_moderate_vs_CPE_very_low <- 
+  col_data_lu_CPE_moderate_vs_CPE_very_low %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+# Stage
+table(col_data_lu_CPE_moderate_vs_CPE_very_low$stage_simple,
+      col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group, useNA = "always")
+
+#              CPE_moderate CPE_very_low <NA>
+#Stage I             40           43    0
+#Stage II            27           20    0
+#Stage III            7           13    0
+#Stage IV             1            0    0
+#<NA>                 0            0    0
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_moderate_vs_CPE_very_low$stage_simple,
+                  col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+#p-value > 0.05
+
+
+
+# Age
+tapply(col_data_lu_CPE_moderate_vs_CPE_very_low$age_at_index,
+       col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group,
+       summary)
+#$CPE_moderate
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#40.00   64.00   69.00   67.44   73.00   84.00 
+
+#$CPE_very_low
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#47.00   62.00   68.50   67.89   74.00   84.00
+
+shapiro.test(col_data_lu_CPE_moderate_vs_CPE_very_low$age_at_index)
+
+
+wilcox.test(col_data_lu_CPE_moderate_vs_CPE_very_low$age_at_index ~
+              col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group)
+
+# p value > 0.05
+
+t.test(col_data_lu_CPE_moderate_vs_CPE_very_low$age_at_index ~
+         col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group)
+
+# p value > 0.05
+
+# The mean age is nearly same across both groups 
+
+# Lets check for gender confoundign 
+
+table(col_data_lu_CPE_moderate_vs_CPE_very_low$sex_at_birth ,
+      col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group,useNA = "always")
+
+#       CPE_moderate CPE_very_low <NA>
+#female           18           29    0
+#male             60           47    0
+#<NA>              0            0    0
+
+set.seed(42)
+fisher.test(col_data_lu_CPE_moderate_vs_CPE_very_low$sex_at_birth ,
+            col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group,
+            simulate.p.value = TRUE)
+
+
+#Fisher's Exact Test for Count Data
+
+#data:  col_data_lu_CPE_moderate_vs_CPE_very_low$sex_at_birth and col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group
+#p-value = 0.006132
+#alternative hypothesis: true odds ratio is not equal to 1
+#95 percent confidence interval:
+ #0.1463881 0.7657723
+#sample estimates:
+#odds ratio 
+# 0.3422972 
+
+
+# The gender is  Confounding 
+
+# There is No Stage Confounding 
+# There is No Age Confounding 
+# There is No Batch Confounding  but still there will be batch correction as usual 
+# ==============================================================================
+# Comparison : CPE_moderate vs CPE_very_low (Set B2)
+# Covariates: sex + batch
+# ==============================================================================
+
+
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_moderate_vs_CPE_very_low$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group <- factor(
+  col_data_lu_CPE_moderate_vs_CPE_very_low$tumor_purity_group, levels = c("CPE_very_low", "CPE_moderate"))
+col_data_lu_CPE_moderate_vs_CPE_very_low$sex_at_birth <- factor(
+  col_data_lu_CPE_moderate_vs_CPE_very_low$sex_at_birth, levels = c("male", "female"))
+col_data_lu_CPE_moderate_vs_CPE_very_low$batch_for_combat <- factor(col_data_lu_CPE_moderate_vs_CPE_very_low$batch_for_combat)
+
+design <- model.matrix(~ sex_at_birth + batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_moderate_vs_CPE_very_low)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_moderate_vs_CPE_very_low <- topTable(fit, coef = "tumor_purity_groupCPE_moderate",
+                                                       number = Inf, sort.by = "P")
+results_limma_CPE_moderate_vs_CPE_very_low$gene <- rownames(results_limma_CPE_moderate_vs_CPE_very_low)
+
+results_limma_CPE_moderate_vs_CPE_very_low_sig <- results_limma_CPE_moderate_vs_CPE_very_low %>%
+  filter(adj.P.Val < 0.05 & (logFC > 0.300 | logFC < -0.379)) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_moderate_vs_CPE_very_low_sig)
+#5042
+rm(dge, keep, design, v, fit)
+
+
+
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                                                                              #
+#         IX. The confounding check CPE_moderate vs normal                     #
+#                                                                              #
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+
+
+col_data_lu_CPE_moderate_vs_normal <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_moderate","Normal"))
+
+table(col_data_lu_CPE_moderate_vs_normal$tumor_purity_group, useNA = "always")
+
+
+#CPE_moderate       Normal         <NA> 
+#  75                35            0 
+
+# Batch
+table(col_data_lu_CPE_moderate_vs_normal$batch,
+      col_data_lu_CPE_moderate_vs_normal$tumor_purity_group,
+      useNA = "always")
+
+
+
+fisher.test(table(col_data_lu_CPE_moderate_vs_normal$batch,
+                  col_data_lu_CPE_moderate_vs_normal$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+
+# p < 0.05
+
+# There is batch confoudning but regardless of the pvalue combat is done 
+
+# Lets make batch combatable by combat 
+
+col_data_lu_CPE_moderate_vs_normal <- col_data_lu_CPE_moderate_vs_normal %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+
+# Age
+tapply(col_data_lu_CPE_moderate_vs_normal$age_at_index,
+       col_data_lu_CPE_moderate_vs_normal$tumor_purity_group, summary)
+
+#$CPE_moderate
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#40.00   64.00   69.00   67.44   73.00   84.00 
+
+#$Normal
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   64.00   69.00   69.26   75.50   85.00 
+
+
+shapiro.test(col_data_lu_CPE_moderate_vs_normal$age_at_index)
+
+
+
+wilcox.test(col_data_lu_CPE_moderate_vs_normal$age_at_index ~
+              col_data_lu_CPE_moderate_vs_normal$tumor_purity_group)
+
+# p > 0.05
+
+
+
+t.test(col_data_lu_CPE_moderate_vs_normal$age_at_index ~
+         col_data_lu_CPE_moderate_vs_normal$tumor_purity_group)
+
+
+# p > 0.05 
+
+
+# Age is similar across both groups 
+
+# Lets check for gender Confounding 
+
+table(col_data_lu_CPE_moderate_vs_normal$sex_at_birth,
+      col_data_lu_CPE_moderate_vs_normal$tumor_purity_group,
+      useNA = "always")
+
+#          CPE_moderate Normal <NA>
+#female           13     11    0
+#male             62     24    0
+#<NA>              0      0    0
+
+fisher.test(col_data_lu_CPE_moderate_vs_normal$sex_at_birth,
+            col_data_lu_CPE_moderate_vs_normal$tumor_purity_group,
+            simulate.p.value = TRUE)
+
+
+#Fisher's Exact Test for Count Data
+
+#data:  col_data_lu_CPE_moderate_vs_normal$sex_at_birth and col_data_lu_CPE_moderate_vs_normal$tumor_purity_group
+#p-value = 0.1359
+#alternative hypothesis: true odds ratio is not equal to 1
+#95 percent confidence interval:
+#  0.1639226 1.3057333
+#sample estimates:
+#  odds ratio 
+#0.4610161
+
+# Gender is not Confounding and age is also not confounding 
+
+
+# Only Batch is Confounding 
+
+# ==============================================================================
+# Comparison : CPE_moderate vs Normal 
+# Covariates: batch only
+# ==============================================================================
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_moderate_vs_normal$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_moderate_vs_normal$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_moderate_vs_normal$tumor_purity_group <- factor(
+  col_data_lu_CPE_moderate_vs_normal$tumor_purity_group, levels = c("Normal", "CPE_moderate"))
+col_data_lu_CPE_moderate_vs_normal$batch_for_combat <- factor(col_data_lu_CPE_moderate_vs_normal$batch_for_combat)
+
+design <- model.matrix(~ batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_moderate_vs_normal)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_moderate_vs_normal <- topTable(fit, coef = "tumor_purity_groupCPE_moderate",
+                                                 number = Inf, sort.by = "P")
+results_limma_CPE_moderate_vs_normal$gene <- rownames(results_limma_CPE_moderate_vs_normal)
+
+results_limma_CPE_moderate_vs_normal_sig_up <- results_limma_CPE_moderate_vs_normal %>%
+  filter(adj.P.Val < 0.05 & logFC >= 1) %>% arrange(desc(logFC))
+results_limma_CPE_moderate_vs_normal_sig_down <- results_limma_CPE_moderate_vs_normal %>%
+  filter(adj.P.Val < 0.05 & logFC <= -1) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_moderate_vs_normal_sig_up)
+#2893
+nrow(results_limma_CPE_moderate_vs_normal_sig_down)
+#3517
+
+rm(dge, keep, design, v, fit)
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#   X. Confounder Check — 
+#        CPE_high vs Normal (Batch / Age / Gender; Stage not testable)
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+col_data_lu_CPE_high_vs_normal <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_high","Normal"))
+
+table(col_data_lu_CPE_high_vs_normal$tumor_purity_group, useNA = "always")
+
+# Batch
+
+table(col_data_lu_CPE_high_vs_normal$batch,
+      col_data_lu_CPE_high_vs_normal$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_high_vs_normal$batch,
+                  col_data_lu_CPE_high_vs_normal$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+# p < 0.05 
+
+col_data_lu_CPE_high_vs_normal <- col_data_lu_CPE_high_vs_normal %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+table(col_data_lu_CPE_high_vs_normal$batch_for_combat)
+
+# Age
+
+tapply(col_data_lu_CPE_high_vs_normal$age_at_index,
+       col_data_lu_CPE_high_vs_normal$tumor_purity_group, summary)
+
+#$CPE_high
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#39.00   63.00   70.00   67.88   73.00   83.00 
+
+#$Normal
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   64.00   69.00   69.26   75.50   85.00
+
+shapiro.test(col_data_lu_CPE_high_vs_normal$age_at_index)
+
+wilcox.test(col_data_lu_CPE_high_vs_normal$age_at_index ~
+              col_data_lu_CPE_high_vs_normal$tumor_purity_group)
+
+# p > 0.05 
+t.test(col_data_lu_CPE_high_vs_normal$age_at_index ~
+         col_data_lu_CPE_high_vs_normal$tumor_purity_group)
+
+
+# p > 0.05 
+
+
+# Gender
+
+table(col_data_lu_CPE_high_vs_normal$sex_at_birth,
+      col_data_lu_CPE_high_vs_normal$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_high_vs_normal$sex_at_birth,
+                  col_data_lu_CPE_high_vs_normal$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+# p value > 0.05
+
+#  Decision summary (CPE_high vs Normal, LUSC):
+#  Batch  → ComBat regardless of p, per project policy
+#  Age    → Exclude
+#  Gender → EXclude
+#  Stage  → not testable (describes the paired tumor, not the normal tissue)
+
+
+
+
+## ============================================================
+# Comparison : CPE_high vs Normal 
+# Covariates: batch only
+# ============================================================
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_high_vs_normal$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_high_vs_normal$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_high_vs_normal$tumor_purity_group <- factor(
+  col_data_lu_CPE_high_vs_normal$tumor_purity_group, levels = c("Normal", "CPE_high"))
+col_data_lu_CPE_high_vs_normal$batch_for_combat <- factor(col_data_lu_CPE_high_vs_normal$batch_for_combat)
+
+design <- model.matrix(~ batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_high_vs_normal)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_high_vs_normal <- topTable(fit, coef = "tumor_purity_groupCPE_high",
+                                             number = Inf, sort.by = "P")
+results_limma_CPE_high_vs_normal$gene <- rownames(results_limma_CPE_high_vs_normal)
+
+results_limma_CPE_high_vs_normal_sig_up <- results_limma_CPE_high_vs_normal %>%
+  filter(adj.P.Val < 0.05 & logFC >= 1) %>% arrange(desc(logFC))
+results_limma_CPE_high_vs_normal_sig_down <- results_limma_CPE_high_vs_normal %>%
+  filter(adj.P.Val < 0.05 & logFC <= -1) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_high_vs_normal_sig_up)
+#3032
+nrow(results_limma_CPE_high_vs_normal_sig_down)
+#3708
+rm(dge, keep, design, v, fit)
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#   XI. Confounder Check — CPE_high vs CPE_low
+#          (Batch / Stage / Age / Gender) 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+col_data_lu_CPE_high_vs_CPE_low <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_high","CPE_low"))
+
+table(col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group, useNA = "always")
+
+# Batch
+
+table(col_data_lu_CPE_high_vs_CPE_low$batch,
+      col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_high_vs_CPE_low$batch,
+                  col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+col_data_lu_CPE_high_vs_CPE_low <- col_data_lu_CPE_high_vs_CPE_low %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+table(col_data_lu_CPE_high_vs_CPE_low$batch_for_combat)
+
+# Stage
+
+table(col_data_lu_CPE_high_vs_CPE_low$stage_simple,
+      col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_high_vs_CPE_low$stage_simple,
+                  col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+# p > 0.05
+# Age
+
+tapply(col_data_lu_CPE_high_vs_CPE_low$age_at_index,
+       col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group, summary)
+
+#$CPE_high
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#39.00   63.00   70.00   67.88   73.00   83.00 
+
+#$CPE_low
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#44.00   61.75   69.50   67.86   74.25   85.00 
+
+shapiro.test(col_data_lu_CPE_high_vs_CPE_low$age_at_index)
+
+wilcox.test(col_data_lu_CPE_high_vs_CPE_low$age_at_index ~
+              col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group)
+
+
+# p > 0.05 
+
+t.test(col_data_lu_CPE_high_vs_CPE_low$age_at_index ~
+         col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group)
+
+
+# p > 0.05 
+
+# Gender
+
+table(col_data_lu_CPE_high_vs_CPE_low$sex_at_birth,
+      col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_high_vs_CPE_low$sex_at_birth,
+                  col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+# p > 0.05
+
+#  Decision summary (CPE_high vs CPE_low, LUSC):
+#  Batch  →  ComBat regardless of p, 
+#  Stage  → EXCLUDE
+#  Age    → EXCLUDE
+#  Gender → EXCLUDE
+
+
+
+
+
+# ============================================================
+# Comparison : CPE_high vs CPE_low 
+# Covariates: batch only
+# ============================================================
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_high_vs_CPE_low$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group <- factor(
+  col_data_lu_CPE_high_vs_CPE_low$tumor_purity_group, levels = c("CPE_low", "CPE_high"))
+col_data_lu_CPE_high_vs_CPE_low$batch_for_combat <- factor(col_data_lu_CPE_high_vs_CPE_low$batch_for_combat)
+
+design <- model.matrix(~ batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_high_vs_CPE_low)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_high_vs_CPE_low <- topTable(fit, coef = "tumor_purity_groupCPE_high",
+                                              number = Inf, sort.by = "P")
+results_limma_CPE_high_vs_CPE_low$gene <- rownames(results_limma_CPE_high_vs_CPE_low)
+
+results_limma_CPE_high_vs_CPE_low_sig <- results_limma_CPE_high_vs_CPE_low %>%
+  filter(adj.P.Val < 0.05 & (logFC > 0.195 | logFC < -0.226)) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_high_vs_CPE_low_sig)
+# 4539
+rm(dge, keep, design, v, fit)
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#   XII. Confounder Check — CPE_high vs CPE_very_low
+#       (Batch / Stage / Age / Gender) 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+col_data_lu_CPE_high_vs_CPE_very_low <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_high","CPE_very_low"))
+
+table(col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group, useNA = "always")
+
+# Batch
+
+table(col_data_lu_CPE_high_vs_CPE_very_low$batch,
+      col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_high_vs_CPE_very_low$batch,
+                  col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+col_data_lu_CPE_high_vs_CPE_very_low <- col_data_lu_CPE_high_vs_CPE_very_low %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+table(col_data_lu_CPE_high_vs_CPE_very_low$batch_for_combat)
+
+# Stage
+
+table(col_data_lu_CPE_high_vs_CPE_very_low$stage_simple,
+      col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_high_vs_CPE_very_low$stage_simple,
+                  col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+# p > 0.05
+# Age
+
+tapply(col_data_lu_CPE_high_vs_CPE_very_low$age_at_index,
+       col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group, summary)
+
+
+shapiro.test(col_data_lu_CPE_high_vs_CPE_very_low$age_at_index)
+
+wilcox.test(col_data_lu_CPE_high_vs_CPE_very_low$age_at_index ~
+              col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group)
+
+# p > 0.05 
+
+t.test(col_data_lu_CPE_high_vs_CPE_very_low$age_at_index ~
+         col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group)
+
+
+# p > 0.05 
+
+# Gender
+
+table(col_data_lu_CPE_high_vs_CPE_very_low$sex_at_birth,
+      col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_high_vs_CPE_very_low$sex_at_birth,
+                  col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+# p > 0.05 
+
+#  Decision summary (CPE_high vs CPE_very_low, LUSC):
+#  Batch  → → ComBat regardless of p, per project policy
+#  Stage  → EXCLUDE
+#  Age    → EXCLUDE
+#  Gender → EXCLUDE
+
+
+# ============================================================
+# Comparison : CPE_high vs CPE_very_low 
+# Covariates:   batch
+# ============================================================
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_high_vs_CPE_very_low$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group <- factor(
+  col_data_lu_CPE_high_vs_CPE_very_low$tumor_purity_group, levels = c("CPE_very_low", "CPE_high"))
+
+col_data_lu_CPE_high_vs_CPE_very_low$batch_for_combat <- factor(col_data_lu_CPE_high_vs_CPE_very_low$batch_for_combat)
+
+design <- model.matrix(~  batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_high_vs_CPE_very_low)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_high_vs_CPE_very_low <- topTable(fit, coef = "tumor_purity_groupCPE_high",
+                                                   number = Inf, sort.by = "P")
+results_limma_CPE_high_vs_CPE_very_low$gene <- rownames(results_limma_CPE_high_vs_CPE_very_low)
+
+results_limma_CPE_high_vs_CPE_very_low_sig <- results_limma_CPE_high_vs_CPE_very_low %>%
+  filter(adj.P.Val < 0.05 & (logFC > 0.383 | logFC < -0.524)) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_high_vs_CPE_very_low_sig)
+#5493
+rm(dge, keep, design, v, fit)
+
+
+
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#   XIII. Confounder Check — 
+#          CPE_low vs Normal 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+col_data_lu_CPE_low_vs_normal <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_low","Normal"))
+
+table(col_data_lu_CPE_low_vs_normal$tumor_purity_group, useNA = "always")
+
+# Batch
+
+table(col_data_lu_CPE_low_vs_normal$batch,
+      col_data_lu_CPE_low_vs_normal$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_low_vs_normal$batch,
+                  col_data_lu_CPE_low_vs_normal$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+col_data_lu_CPE_low_vs_normal <- col_data_lu_CPE_low_vs_normal %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+table(col_data_lu_CPE_low_vs_normal$batch_for_combat)
+
+# Age
+
+tapply(col_data_lu_CPE_low_vs_normal$age_at_index,
+       col_data_lu_CPE_low_vs_normal$tumor_purity_group, summary)
+
+
+#$CPE_low
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#44.00   61.75   69.50   67.86   74.25   85.00 
+
+#$Normal
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   64.00   69.00   69.26   75.50   85.00
+
+
+shapiro.test(col_data_lu_CPE_low_vs_normal$age_at_index)
+
+wilcox.test(col_data_lu_CPE_low_vs_normal$age_at_index ~
+              col_data_lu_CPE_low_vs_normal$tumor_purity_group)
+
+
+# p > 0.05 
+
+t.test(col_data_lu_CPE_low_vs_normal$age_at_index ~
+         col_data_lu_CPE_low_vs_normal$tumor_purity_group)
+
+
+# p > 0.05 
+
+# Gender
+
+table(col_data_lu_CPE_low_vs_normal$sex_at_birth,
+      col_data_lu_CPE_low_vs_normal$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_low_vs_normal$sex_at_birth,
+                  col_data_lu_CPE_low_vs_normal$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+
+# p > 0.05 
+
+#  Decision summary (CPE_low vs Normal, LUSC):
+#  Batch  → ComBat regardless of p, per project policy
+#  Age    → EXCLUDE 
+#  Gender → EXCLUDE
+#  Stage  → not testable (describes the paired tumor, not the normal tissue)
+
+# ============================================================
+# Comparison : CPE_low vs Normal 
+# Covariates: batch only
+# ============================================================
+
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_low_vs_normal$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_low_vs_normal$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_low_vs_normal$tumor_purity_group <- factor(
+  col_data_lu_CPE_low_vs_normal$tumor_purity_group, levels = c("Normal", "CPE_low"))
+col_data_lu_CPE_low_vs_normal$batch_for_combat <- factor(col_data_lu_CPE_low_vs_normal$batch_for_combat)
+
+design <- model.matrix(~ batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_low_vs_normal)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_low_vs_normal <- topTable(fit, coef = "tumor_purity_groupCPE_low",
+                                            number = Inf, sort.by = "P")
+results_limma_CPE_low_vs_normal$gene <- rownames(results_limma_CPE_low_vs_normal)
+
+results_limma_CPE_low_vs_normal_sig_up <- results_limma_CPE_low_vs_normal %>%
+  filter(adj.P.Val < 0.05 & logFC >= 1) %>% arrange(desc(logFC))
+results_limma_CPE_low_vs_normal_sig_down <- results_limma_CPE_low_vs_normal %>%
+  filter(adj.P.Val < 0.05 & logFC <= -1) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_low_vs_normal_sig_up)
+#2609
+nrow(results_limma_CPE_low_vs_normal_sig_down)
+#3708
+rm(dge, keep, design, v, fit)
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#   XIV. Confounder Check — CPE_low vs CPE_very_high
+#        (Batch / Stage / Age / Gender) 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+col_data_lu_CPE_low_vs_CPE_very_high <- col_data_lu %>%
+  filter(tumor_purity_group %in% c("CPE_low","CPE_very_high"))
+
+table(col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group, useNA = "always")
+
+# Batch
+
+table(col_data_lu_CPE_low_vs_CPE_very_high$batch,
+      col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_low_vs_CPE_very_high$batch,
+                  col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+col_data_lu_CPE_low_vs_CPE_very_high <- col_data_lu_CPE_low_vs_CPE_very_high %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+table(col_data_lu_CPE_low_vs_CPE_very_high$batch_for_combat)
+
+# Stage
+
+table(col_data_lu_CPE_low_vs_CPE_very_high$stage_simple,
+      col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_low_vs_CPE_very_high$stage_simple,
+                  col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE)
+#p > 0.05
+
+# Age
+
+tapply(col_data_lu_CPE_low_vs_CPE_very_high$age_at_index,
+       col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group, summary)
+
+#$CPE_low
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#44.00   61.75   69.50   67.86   74.25   85.00 
+
+#$CPE_very_high
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   58.00   65.00   64.63   70.00   83.00 
+
+shapiro.test(col_data_lu_CPE_low_vs_CPE_very_high$age_at_index)
+
+wilcox.test(col_data_lu_CPE_low_vs_CPE_very_high$age_at_index ~
+              col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group)
+
+
+# p < 0.05 
+
+t.test(col_data_lu_CPE_low_vs_CPE_very_high$age_at_index ~
+         col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group)
+
+# p < 0.05 
+
+# Gender
+
+table(col_data_lu_CPE_low_vs_CPE_very_high$sex_at_birth,
+      col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group, useNA = "always")
+
+set.seed(42)
+fisher.test(table(col_data_lu_CPE_low_vs_CPE_very_high$sex_at_birth,
+                  col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group),
+            simulate.p.value = TRUE)
+
+# p > 0.05
+
+
+#  Decision summary (CPE_low vs CPE_very_high, LUSC):
+#  Batch  → INCLUDE ComBat regardless of p, per project policy
+#  Stage  → EXCLUDE
+#  Age    → INCLUDE
+#  Gender → EXCLUDE
+
+# ============================================================
+# Comparison : CPE_low vs CPE_very_high (Set C, low anchor)
+# Covariates: age + batch
+# ============================================================
+dge <- DGEList(counts = expr_matrix_lu[, col_data_lu_CPE_low_vs_CPE_very_high$barcode])
+keep <- filterByExpr(dge, group = col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group, min.count = 10)
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge, method = "TMM")
+
+col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group <- factor(
+  col_data_lu_CPE_low_vs_CPE_very_high$tumor_purity_group, levels = c("CPE_very_high", "CPE_low"))
+col_data_lu_CPE_low_vs_CPE_very_high$batch_for_combat <- factor(col_data_lu_CPE_low_vs_CPE_very_high$batch_for_combat)
+
+design <- model.matrix(~ age_at_index + batch_for_combat + tumor_purity_group,
+                       data = col_data_lu_CPE_low_vs_CPE_very_high)
+v <- voom(dge, design, plot = FALSE)
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+colnames(fit$coefficients)
+
+results_limma_CPE_low_vs_CPE_very_high <- topTable(fit, coef = "tumor_purity_groupCPE_low",
+                                                   number = Inf, sort.by = "P")
+results_limma_CPE_low_vs_CPE_very_high$gene <- rownames(results_limma_CPE_low_vs_CPE_very_high)
+
+results_limma_CPE_low_vs_CPE_very_high_sig <- results_limma_CPE_low_vs_CPE_very_high %>%
+  filter(adj.P.Val < 0.05 & (logFC > 0.300 | logFC < -0.378)) %>% arrange(desc(logFC))
+
+nrow(results_limma_CPE_low_vs_CPE_very_high_sig)
+#4839
+rm(dge, keep, design, v, fit)
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#                          XV. Deconvolution 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# Set_A1_up
+Set_A1_up <- results_limma_CPE_very_high_vs_normal_sig_up$gene
+
+
+# SET_A1_down
+SET_A1_down <- results_limma_CPE_very_high_vs_normal_sig_down$gene
+
+# Set B1
+Set_B1 <- results_limma_CPE_moderate_vs_CPE_very_high_sig$gene
+
+# Set_C1
+
+Set_C1 <- results_limma_CPE_low_vs_CPE_very_high_sig$gene
+
+
+# Set_D1
+Set_D1 <- results_limma_CPE_very_low_vs_CPE_very_high_sig$gene
+
+
+# For up-regulated genes in CPE_very_high which are stable across the stromal_changes 
+
+# Step 1 — remove stromal sensitive genes from Set A
+SetX_CPE_very_high_up <- setdiff(Set_A1_up, Set_B1)
+
+length(SetX_CPE_very_high_up)
+#[1] 2784
+
+# Step 2 
+SetX2_CPE_very_high_up <- setdiff(SetX_CPE_very_high_up,Set_C1)
+length(SetX2_CPE_very_high_up)
+#[1]1776
+
+# Step 3 — remove second stromal filter
+SetFinal_CPE_very_high_up <- setdiff(SetX2_CPE_very_high_up, Set_D1)
+length(SetFinal_CPE_very_high_up)
+
+#[1] 1473
+
+# For down regulated genes in CPE_very_high which are stable across the stromal_changes 
+
+SetX_CPE_very_high_down <- setdiff(SET_A1_down, Set_B1)
+
+length(SetX_CPE_very_high_down)
+#[1] 2830
+
+SetX2_CPE_very_high_down <- setdiff(SetX_CPE_very_high_down,Set_C1)
+length(SetX2_CPE_very_high_down)
+#[1] 1733
+
+
+SetFinal_CPE_very_high_down <- setdiff(SetX2_CPE_very_high_down,Set_D1)
+length(SetFinal_CPE_very_high_down)
+#[1] 1325
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                    XVI Deconvolution — Gene Set 2                                #
+#                    Anchor : CPE_very_low (stromal_high)                      #
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# Set_A2_up
+Set_A2_up <- results_limma_CPE_very_low_vs_normal_sig_up$gene
+
+# Set_A2_down
+Set_A2_down <- results_limma_CPE_very_low_vs_normal_sig_down$gene
+# They are the genes which are decreased approximately 4 fold in the 
+# stromal_high(CPE_very_low) samples compared to normal
+
+# Set_B2
+Set_B2 <- results_limma_CPE_moderate_vs_CPE_very_low_sig$gene
+
+
+# Set_C2
+
+Set_C2 <- results_limma_CPE_high_vs_CPE_very_low_sig$gene
+
+# Set_D1
+Set_D1 <- results_limma_CPE_very_low_vs_CPE_very_high_sig$gene
+
+
+# For up-regulated genes in CPE_very_low which are stable across stromal changes
+
+# Step 1 — remove stromal sensitive genes from Set A
+SetX_CPE_very_low_up <- setdiff(Set_A2_up, Set_B2)
+length(SetX_CPE_very_low_up)
+#[1] 1111
+
+# Step 2 
+SetX2_CPE_very_low_up <- setdiff(SetX_CPE_very_low_up,Set_C2)
+length(SetX2_CPE_very_low_up)
+# 794
+
+
+# Step 3 — remove second stromal filter
+SetFinal_CPE_very_low_up <- setdiff(SetX2_CPE_very_low_up, Set_D1)
+length(SetFinal_CPE_very_low_up)
+#[1] 686
+
+
+# For down-regulated genes in CPE_very_low which are stable across stromal changes
+
+# Step 1 — remove stromal sensitive genes from Set A
+SetX_CPE_very_low_down <- setdiff(Set_A2_down, Set_B2)
+length(SetX_CPE_very_low_down)
+#[1] 1202
+
+SetX2_CPE_very_low_down <- setdiff(SetX_CPE_very_low_down, Set_C2)
+length(SetX2_CPE_very_low_down)
+#[1] 975
+
+
+# Step 2 — remove second stromal filter
+SetFinal_CPE_very_low_down <- setdiff(SetX2_CPE_very_low_down, Set_D1)
+length(SetFinal_CPE_very_low_down)
+#[1] 881
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                    XVII Deconvolution — Gene Set 3                                #
+#                    Anchor : CPE_moderate (stromal_medium)                    #
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+# Set_A3_up
+Set_A3_up <- results_limma_CPE_moderate_vs_normal_sig_up$gene
+
+# Set_A3_down
+Set_A3_down <- results_limma_CPE_moderate_vs_normal_sig_down$gene
+# They are the genes which are decreased approximately 4 fold in the
+# stromal_medium(CPE_moderate) samples compared to normal
+
+# Set_B1
+Set_B1 <- results_limma_CPE_moderate_vs_CPE_very_high_sig$gene
+
+
+# Set_B2
+Set_B2 <- results_limma_CPE_moderate_vs_CPE_very_low_sig$gene
+
+
+# For up-regulated genes in CPE_moderate which are stable across stromal changes
+
+# Step 1 — remove stromal sensitive genes from Set A
+SetX_CPE_moderate_up <- setdiff(Set_A3_up, Set_B1)
+length(SetX_CPE_moderate_up)
+# 2629
+
+# Step 2 — remove second stromal filter
+SetFinal_CPE_moderate_up <- setdiff(SetX_CPE_moderate_up, Set_B2)
+length(SetFinal_CPE_moderate_up)
+# 1318
+
+# For down-regulated genes in CPE_moderate which are stable across stromal changes
+
+# Step 1 — remove stromal sensitive genes from Set A
+SetX_CPE_moderate_down <- setdiff(Set_A3_down, Set_B1)
+length(SetX_CPE_moderate_down)
+# 2702
+
+# Step 2 — remove second stromal filter
+SetFinal_CPE_moderate_down <- setdiff(SetX_CPE_moderate_down, Set_B2)
+length(SetFinal_CPE_moderate_down)
+
+# 1392
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#   XVIII. Deconvolution — Gene Set 4, Anchor: CPE_high 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+Set_A4_up   <- results_limma_CPE_high_vs_normal_sig_up$gene     # Set_A4_up
+Set_A4_down <- results_limma_CPE_high_vs_normal_sig_down$gene   # Set_A4_down
+
+Set_E1 <- results_limma_CPE_high_vs_CPE_low_sig$gene        # Set_E1 
+Set_C2 <- results_limma_CPE_high_vs_CPE_very_low_sig$gene   # Set_C2
+
+# Step 1 
+
+SetX_CPE_high_up <- setdiff(Set_A4_up, Set_E1)
+length(SetX_CPE_high_up)
+
+#1918
+
+SetFinal_CPE_high_up <- setdiff(SetX_CPE_high_up, Set_C2)
+length(SetFinal_CPE_high_up)
+#1122
+
+# Step 2 
+
+SetX_CPE_high_down <- setdiff(Set_A4_down, Set_E1)
+length(SetX_CPE_high_down)
+
+#1789
+
+SetFinal_CPE_high_down <- setdiff(SetX_CPE_high_down, Set_C2)
+length(SetFinal_CPE_high_down)
+
+#1228
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#   XIX. Deconvolution — Gene Set 5, Anchor: CPE_low (GAP 2, promoted to anchor)
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+Set_A5_up   <- results_limma_CPE_low_vs_normal_sig_up$gene      # Set_A5_up
+Set_A5_down <- results_limma_CPE_low_vs_normal_sig_down$gene    # Set_A5_down
+
+Set_E1 <- results_limma_CPE_high_vs_CPE_low_sig$gene         # Set_E1 
+Set_C1 <- results_limma_CPE_low_vs_CPE_very_high_sig$gene    # Set_C1
+
+# Step 1 — remove genes sensitive to the high-vs-low purity swing.
+
+SetX_CPE_low_up <- setdiff(Set_A5_up, Set_E1)
+length(SetX_CPE_low_up)
+#1763
+
+SetFinal_CPE_low_up <- setdiff(SetX_CPE_low_up, Set_C1)
+length(SetFinal_CPE_low_up)
+#1365
+
+# Step 2 — remove genes sensitive to the low-vs-very_high purity swing.
+
+SetX_CPE_low_down <- setdiff(Set_A5_down, Set_E1)
+length(SetX_CPE_low_down)
+#1601
+
+SetFinal_CPE_low_down <- setdiff(SetX_CPE_low_down, Set_C1)
+length(SetFinal_CPE_low_down)
+#1395
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                                                                              #
+#       XX FINAL DECONVOLUTION — STROMAL-INDEPENDENT                            #
+#              TUMOR INTRINSIC GENE SETS (LUSC, 5-ANCHOR VERSION)             #
+#                                                                              #
+#                           #
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+SetFinal_up <- Reduce(intersect, list(SetFinal_CPE_very_high_up,
+                                      SetFinal_CPE_high_up,
+                                      SetFinal_CPE_moderate_up,
+                                      SetFinal_CPE_low_up,
+                                      SetFinal_CPE_very_low_up))
+length(SetFinal_up)
+#392
+
+SetFinal_down <- Reduce(intersect, list(SetFinal_CPE_very_high_down,
+                                        SetFinal_CPE_high_down,
+                                        SetFinal_CPE_moderate_down,
+                                        SetFinal_CPE_low_down,
+                                        SetFinal_CPE_very_low_down))
+length(SetFinal_down)
+#613
+
+
+
+
+
+
+a <- results_limma_CPE_moderate_vs_CPE_very_high %>%
+  filter((logFC > 0.213 | logFC < -0.250) & adj.P.Val > 0.05) %>%
+  pull(gene)
+
+length(a)
+#4394
+
+b <- results_limma_CPE_low_vs_CPE_very_high %>%
+  filter((logFC > 0.300 | logFC < -0.378)& adj.P.Val > 0.05) %>%
+  pull(gene)
+
+length(b)
+#1578
+
+c <- results_limma_CPE_very_low_vs_CPE_very_high %>%
+  filter((logFC > 0.475 | logFC < -0.713) & adj.P.Val > 0.05) %>%
+  pull(gene)
+length(c)
+#465
+
+d <- results_limma_CPE_moderate_vs_CPE_very_low %>%
+  filter((logFC > 0.300 | logFC < -0.379) & adj.P.Val > 0.05) %>%
+  pull(gene)
+
+length(d)
+#1510
+
+e <- results_limma_CPE_high_vs_CPE_very_low %>%
+  filter((logFC > 0.383 | logFC < -0.524)& adj.P.Val > 0.05) %>%
+  pull(gene)
+
+length(e)
+#624
+f <- results_limma_CPE_high_vs_CPE_low %>%
+  filter((logFC > 0.195 | logFC < -0.226)& adj.P.Val > 0.05) %>%
+  pull(gene)
+
+length(f)
+#3573
+
+
+leaky_genes <- Reduce(union, list(a, b, c, d, e, f))
+length(leaky_genes)
+#7002
+
+
+
+length(intersect(SetFinal_up, leaky_genes))
+#310
+length(intersect(SetFinal_down, leaky_genes))
+#310
+
+SetFinal_up_clean <- setdiff(SetFinal_up,leaky_genes)
+length(SetFinal_up_clean)
+#86
+SetFinal_down_clean <- setdiff(SetFinal_down, leaky_genes)
+length(SetFinal_down_clean)
+#303
+
+
+
+max_len <- max(length(SetFinal_up_clean), length(SetFinal_down_clean))
+
+SetFinal_genes_lu_df <- data.frame(
+  LUSC_up = c(SetFinal_up_clean, rep(NA, max_len - length(SetFinal_up_clean))),
+  LUSC_down = c(SetFinal_down_clean, rep(NA, max_len - length(SetFinal_down_clean)))
+)
+
+
+
+
+
+
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#           XXI  Lets do data correction  of these genes  
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+expr_matrix_lu <- expr_matrix_lu[,col_data_lu$barcode]
+
+dge_expr_matrix_lu <- DGEList(expr_matrix_lu)
+keep <- filterByExpr(dge_expr_matrix_lu, 
+                     min.count = 10,group = col_data_lu$tissue_type)
+
+dge_expr_matrix_lu <- dge_expr_matrix_lu[keep,,keep.lib.sizes = FALSE]
+dge_expr_matrix_lu <- calcNormFactors(dge_expr_matrix_lu, method = "TMM")
+
+dge_cpm_expr_matrix_lu <- cpm(dge_expr_matrix_lu, log = TRUE, prior.count = 1)
+
+# batch for combat 
+
+col_data_lu <- col_data_lu %>%
+  add_count(batch) %>%
+  mutate(batch_for_combat = case_when(
+    n >= 2 ~ batch,
+    n <  2 ~ "other"
+  ))
+
+# Lets check confounding 
+
+tapply(col_data_lu$age_at_index, col_data_lu$tissue_type, summary)
+#$Normal
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#45.00   64.00   69.00   69.26   75.50   85.00 
+
+#$Tumor
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#39.00   62.00   68.00   67.14   73.00   85.00 
+
+t.test(col_data_lu$age_at_index ~ col_data_lu$tissue_type)
+#p-value = 0.2071
+
+set.seed(42)
+fisher.test(col_data_lu$sex_at_birth, col_data_lu$tissue_type, 
+            simulate.p.value = TRUE)
+#p-value = 0.5472
+
+mod <- model.matrix(~ tissue_type , data = col_data_lu)
+
+# Combat 
+library(sva)
+combat_log <- ComBat(
+  dat = dge_cpm_expr_matrix_lu,
+  batch = col_data_lu$batch_for_combat,
+  par.prior = TRUE,
+  mod = mod
+)
+
+# lets convert the batch corrected normalized expr_matrix of combat_log 
+# to linear scale 
+
+linear_combat <- 2^(combat_log)
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#                  XXII Lets calculate the median change between Tumor and 
+#               Normal Samples of the SET_final_up genes 
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+
+linear_combat_up <- linear_combat[SetFinal_up_clean,]
+
+#For Tumor 
+
+linear_combat_tumor_up <- linear_combat_up[,col_data_lu_tumor$barcode]
+
+median_up_genes_tumor <- apply(linear_combat_tumor_up,1,median)
+q25_up_genes_tumor    <- apply(linear_combat_tumor_up,1,quantile,probs = 0.25)
+mean_up_genes_tumor   <- apply(linear_combat_tumor_up,1,mean) 
+sd_up_genes_tumor     <- apply(linear_combat_tumor_up,1,sd)
+
+#For Normal
+
+linear_combat_normal_up <- linear_combat_up[,col_data_lu_normal$barcode]
+
+median_up_genes_normal <- apply(linear_combat_normal_up,1,median)
+mean_up_genes_normal   <- apply(linear_combat_normal_up,1,mean) 
+sd_up_genes_normal     <- apply(linear_combat_normal_up,1,sd)
+# Data_frame
+
+median_up_tumor_vs_normal_df <- data.frame(
+  gene      = names(median_up_genes_tumor),
+  sd_tumor_up = sd_up_genes_tumor,
+  mean_tumor_up = mean_up_genes_tumor,
+  median_tumor_up = median_up_genes_tumor,
+  q25_tumor_up    = q25_up_genes_tumor,
+  sd_normal_up   = sd_up_genes_normal,
+  mean_normal_up = mean_up_genes_normal,
+  median_normal_up = median_up_genes_normal
+  )
+
+
+median_up_tumor_vs_normal_df <- median_up_tumor_vs_normal_df %>%
+  mutate(Tumor_median_div_Normal_median = median_tumor_up/median_normal_up ,
+         Tumor_q25_div_Normal_median = q25_tumor_up/median_normal_up,
+         cv_tumor = sd_tumor_up/mean_tumor_up,
+         cv_normal= sd_normal_up/mean_normal_up)
+
+
+
+median_up_tumor_vs_normal_df <- median_up_tumor_vs_normal_df %>%
+  mutate(
+    tier = case_when(
+      Tumor_median_div_Normal_median >= 2 & Tumor_q25_div_Normal_median >= 2   ~ "Tier 1",
+      Tumor_median_div_Normal_median >= 2 & Tumor_q25_div_Normal_median >= 1.5   ~ "Tier 2",
+      Tumor_median_div_Normal_median >= 2 & Tumor_q25_div_Normal_median >  1    ~ "Tier 3",
+      Tumor_median_div_Normal_median >= 1.5 & Tumor_q25_div_Normal_median >= 1.5 ~ "Tier 4",
+      Tumor_median_div_Normal_median >= 1.5 & Tumor_q25_div_Normal_median >= 1 ~ "Tier 5",
+      Tumor_median_div_Normal_median >= 1                                     ~ "Tier 6",
+      TRUE ~ "Below threshold"
+    )
+  )
+
+
+median_up_tumor_vs_normal_df%>%
+  count(tier)
+#    tier  n
+#1 Tier 1 42
+#2 Tier 2 32
+#3 Tier 3  9
+#4 Tier 4  1
+#5 Tier 6  2
+
+
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                 XXIV   Lets calculate the median change between Tumor and 
+#               Normal Samples of the SET_final_down genes 
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+linear_combat_down <- linear_combat[SetFinal_down_clean,]
+
+#For Tumor 
+linear_combat_tumor_down <- linear_combat_down[,col_data_lu_tumor$barcode]
+median_down_genes_tumor <- apply(linear_combat_tumor_down,1,median)
+q75_down_genes_tumor    <- apply(linear_combat_tumor_down,1,quantile,probs = 0.75)
+mean_down_genes_tumor   <- apply(linear_combat_tumor_down,1,mean) 
+sd_down_genes_tumor     <- apply(linear_combat_tumor_down,1,sd)
+
+#For Normal
+linear_combat_normal_down <- linear_combat_down[,col_data_lu_normal$barcode]
+median_down_genes_normal <- apply(linear_combat_normal_down,1,median)
+mean_down_genes_normal   <- apply(linear_combat_normal_down,1,mean) 
+sd_down_genes_normal     <- apply(linear_combat_normal_down,1,sd)
+
+# Data_frame
+median_down_tumor_vs_normal_df <- data.frame(
+  gene      = names(median_down_genes_tumor),
+  sd_tumor_down = sd_down_genes_tumor,
+  mean_tumor_down = mean_down_genes_tumor,
+  median_tumor_down = median_down_genes_tumor,
+  q75_tumor_down    = q75_down_genes_tumor,
+  sd_normal_down   = sd_down_genes_normal,
+  mean_normal_down = mean_down_genes_normal,
+  median_normal_down = median_down_genes_normal
+)
+
+median_down_tumor_vs_normal_df <- median_down_tumor_vs_normal_df %>%
+  mutate(Normal_median_div_Tumor_median = median_normal_down/median_tumor_down ,
+         Normal_median_div_Tumor_q75 = median_normal_down/q75_tumor_down,
+         cv_tumor = sd_tumor_down/mean_tumor_down,
+         cv_normal= sd_normal_down/mean_normal_down)
+
+
+
+
+
+median_down_tumor_vs_normal_df <- median_down_tumor_vs_normal_df %>%
+  mutate(
+    tier = case_when(
+      Normal_median_div_Tumor_median >= 2 & Normal_median_div_Tumor_q75 >= 2   ~ "Tier 1",
+      Normal_median_div_Tumor_median >= 2 & Normal_median_div_Tumor_q75 >= 1.5   ~ "Tier 2",
+      Normal_median_div_Tumor_median >= 2 & Normal_median_div_Tumor_q75 > 1    ~ "Tier 3",
+      Normal_median_div_Tumor_median >= 1.5 & Normal_median_div_Tumor_q75 >= 1.5 ~ "Tier 4",
+      Normal_median_div_Tumor_median >= 1.5 & Normal_median_div_Tumor_q75 >= 1 ~ "Tier 5",
+      Normal_median_div_Tumor_median >= 1                                     ~ "Tier 6",
+      TRUE ~ "Below threshold"
+    )
+  )
+
+median_down_tumor_vs_normal_df %>%
+  count(tier)
+
+#    tier   n
+#1 Tier 1 229
+#2 Tier 2  62
+#3 Tier 3  11
+#4 Tier 6   1
+
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                             XXV    Heatmap 
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+#------------------------------------------------------------------#
+# Z-score — anchored to Normal samples only, not the pooled
+# Normal+Tumor population.
+#------------------------------------------------------------------#
+
+normal_barcodes_lu <- col_data_lu$barcode[col_data_lu$tissue_type == "Normal"]
+
+cpm_dge_expr_matrix_lu_heatmap_genes <- combat_log[c(SetFinal_up_clean, SetFinal_down_clean), col_data_lu$barcode]
+
+mean_normal_lu <- apply(cpm_dge_expr_matrix_lu_heatmap_genes[, normal_barcodes_lu], 1, mean)
+sd_normal_lu   <- apply(cpm_dge_expr_matrix_lu_heatmap_genes[, normal_barcodes_lu], 1, sd)
+
+# Guard against zero-variance genes in the Normal group specifically —
+# scale()'s pooled version would rarely hit this, but Normal alone is a
+# smaller, more homogeneous group where sd = 0 is more plausible for a
+# handful of genes. These would produce Inf/NaN below if unhandled.
+
+stopifnot(sum(sd_normal_lu == 0) == 0)
+
+mat_z_lu <- sweep(cpm_dge_expr_matrix_lu_heatmap_genes, 1, mean_normal_lu, "-")
+mat_z_lu <- sweep(mat_z_lu, 1, sd_normal_lu, "/")
+
+stopifnot(sum(is.na(mat_z_lu)) == 0)
+
+quantile(abs(mat_z_lu), c(0.5, 0.9, 0.95, 0.99, 1))
+
+# Check the quantile output above before picking the clip value — clip at
+# whatever keeps ~95% of the matrix showing real gradation while trimming
+# only the rarer extreme tail (6 was the right call for LUSC's own
+# distribution when this was last run — reconfirm rather than assume).
+
+mat_z_lu[mat_z_lu >  6] <-  6
+mat_z_lu[mat_z_lu < -6] <- -6
+
+#------------------------------------------------------------------------------#
+#                           Annotations for the heatmap
+#------------------------------------------------------------------------------#
+
+annotation_col_lu <- data.frame(
+  row.names = col_data_lu$barcode,
+  tissue_type = col_data_lu$tissue_type,
+  Tumor_purity_group = col_data_lu$tumor_purity_group
+)
+
+SetFinal_up_df_lu <- as.data.frame(SetFinal_up_clean)
+SetFinal_up_df_lu$Direction <- rep("Up", nrow(SetFinal_up_df_lu))
+colnames(SetFinal_up_df_lu) <- c("Gene","Direction")
+
+SetFinal_down_df_lu <- as.data.frame(SetFinal_down_clean)
+SetFinal_down_df_lu$Direction <- rep("Down", nrow(SetFinal_down_df_lu))
+colnames(SetFinal_down_df_lu) <- c("Gene","Direction")
+
+SET_Final_df_lu <- rbind(SetFinal_up_df_lu, SetFinal_down_df_lu)
+
+annotation_row_lu <- data.frame(
+  row.names = SET_Final_df_lu$Gene,
+  Direction = SET_Final_df_lu$Direction
+)
+
+library(pheatmap)
+library(RColorBrewer)
+
+my_breaks <- seq(-6, 6, length.out = 101)
+my_colors <- colorRampPalette(c("blue", "white", "red"))(100)
+
+
+pheatmap(mat_z_lu,
+         annotation_col = annotation_col_lu,
+         annotation_row = annotation_row_lu,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         color = my_colors,
+         breaks = my_breaks,
+        cluster_cols = FALSE,
+        cluster_rows = FALSE
+        )
+        
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                      XXVI    Violin Plot — CPE by Purity Group (LUSC)
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+library(ggplot2)
+
+# Use only the tumor samples (Normal has no CPE, by construction) and set
+# a sensible factor order so the groups appear from lowest to highest
+# purity left-to-right, rather than alphabetical default order.
+
+col_data_lu_tumor$tumor_purity_group <- factor(
+  col_data_lu_tumor$tumor_purity_group,
+  levels = c("CPE_very_low", "CPE_low", "CPE_moderate", "CPE_high", "CPE_very_high")
+)
+
+# Reconvert CPE to numeric if it's still character from the earlier
+# as.character() conversions done before the rbind() steps.
+
+col_data_lu_tumor$CPE <- as.numeric(as.character(col_data_lu_tumor$CPE))
+
+p_violin_lusc  <- ggplot(col_data_lu_tumor, aes(x = tumor_purity_group, y = CPE, fill = tumor_purity_group)) +
+  geom_violin(trim = FALSE, alpha = 0.7) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  geom_jitter(width = 0.08, size = 0.6, alpha = 0.3, color = "black") +
+  scale_fill_manual(values = c(
+    "CPE_very_low"  = "#2166AC",
+    "CPE_low"       = "#67A9CF",
+    "CPE_moderate"  = "#F7F7F7",
+    "CPE_high"      = "#EF8A62",
+    "CPE_very_high" = "#B2182B"
+  )) +
+  labs(
+    title = "CPE Distribution Across Purity Groups (LUSC)",
+    x = "Tumor Purity Group",
+    y = "CPE (Tumor Purity)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+print(p_violin_lusc)
+
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+#                     XXVII     UpSet Plot — 5-Anchor Overlap (LUSC)
+#------------------------------------------------------------------------------#
+#------------------------------------------------------------------------------#
+
+library(UpSetR)
+
+#------------------------------------------------------------------------------#
+#                                UP direction (leaky genes removed)
+#------------------------------------------------------------------------------#
+
+upset_list_up_lu <- list(
+  CPE_very_high = setdiff(SetFinal_CPE_very_high_up, leaky_genes),
+  CPE_high      = setdiff(SetFinal_CPE_high_up,      leaky_genes),
+  CPE_moderate  = setdiff(SetFinal_CPE_moderate_up,  leaky_genes),
+  CPE_low       = setdiff(SetFinal_CPE_low_up,       leaky_genes),
+  CPE_very_low  = setdiff(SetFinal_CPE_very_low_up,  leaky_genes)
+)
+
+upset(
+  fromList(upset_list_up_lu),
+  nsets = 5,
+  order.by = "freq",
+  main.bar.color = "#B2182B",
+  sets.bar.color = "#EF8A62",
+  matrix.color = "#B2182B",
+  text.scale = 1.3,
+  mainbar.y.label = "Upregulated Genes — Intersection Size",
+  sets.x.label = "Genes per Anchor (Up)"
+)
+
+
+#------------------------------------------------------------------------------#
+#                               DOWN direction (leaky genes removed)
+#------------------------------------------------------------------------------#
+
+upset_list_down_lu <- list(
+  CPE_very_high = setdiff(SetFinal_CPE_very_high_down, leaky_genes),
+  CPE_high      = setdiff(SetFinal_CPE_high_down,      leaky_genes),
+  CPE_moderate  = setdiff(SetFinal_CPE_moderate_down,  leaky_genes),
+  CPE_low       = setdiff(SetFinal_CPE_low_down,       leaky_genes),
+  CPE_very_low  = setdiff(SetFinal_CPE_very_low_down,  leaky_genes)
+)
+
+upset(
+  fromList(upset_list_down_lu),
+  nsets = 5,
+  order.by = "freq",
+  main.bar.color = "#2166AC",
+  sets.bar.color = "#67A9CF",
+  matrix.color = "#2166AC",
+  text.scale = 1.3,
+  mainbar.y.label = "Downregulated Genes — Intersection Size",
+  sets.x.label = "Genes per Anchor (Down)"
+)
