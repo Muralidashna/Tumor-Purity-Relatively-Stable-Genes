@@ -38,7 +38,7 @@ Each script is self-contained and covers data acquisition (TCGAbiolinks), clinic
 - **Batch correction for effect-size estimation**: `sva::ComBat`
 - **Visualization**: `pheatmap`, `ggplot2`, `UpSetR`
 
-See the manuscript (preprint link to be added) for full methodological detail.
+See the manuscript (https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7222879) for full methodological detail.
 
 ## Requirements
 
