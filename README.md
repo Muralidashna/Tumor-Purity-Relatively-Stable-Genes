@@ -43,17 +43,11 @@ See the manuscript (preprint link to be added) for full methodological detail.
 ## Requirements
 
 R (≥ 4.2) with the following packages:
-`TCGAbiolinks`, `SummarizedExperiment`, `edgeR`, `limma`, `sva`, `tidyverse`, `ggplot2`, `pheatmap`, `UpSetR`, `writexl`, `estimate`
+`TCGAbiolinks`, `SummarizedExperiment`, `edgeR`, `limma`, `sva`, `tidyverse`, `ggplot2`, `pheatmap`, `UpSetR`, `writexl`
 
 ## Usage
 
 Each script can be run independently and end-to-end for its respective cohort, provided the required packages are installed and TCGA data access is available via `TCGAbiolinks`.
-
-## Citation
-
-If you use this framework or code, please cite:
-
-> [Author]. [Title]. [Journal/preprint, year]. [DOI/link]
 
 ## License
 
@@ -61,4 +55,5 @@ See [LICENSE](LICENSE).
 
 ## Contact
 
-Murali Dashna Anandan — Independent Researcher, Coimbatore, Tamil Nadu, India
+Murali Dashna Anandan 
+email: murali.dashna@hotmail.com
